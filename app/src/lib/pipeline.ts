@@ -1,10 +1,23 @@
 import { v4 as uuid } from "uuid";
+import axios from "axios";
+import { exec } from "child_process";
+import { promisify } from "util";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { HttpsProxyAgent } from "https-proxy-agent";
 import { readConfigs, readCreators, readVideos, writeVideos } from "./csv";
 import { scrapeReels } from "./apify";
 import { uploadVideo, analyzeVideo } from "./gemini";
 import { generateNewConcepts } from "./claude";
-import type { PipelineParams, PipelineProgress, Video, ActiveTask } from "./types";
+import type {
+  PipelineParams,
+  PipelineProgress,
+  Video,
+  ActiveTask,
+} from "./types";
 
+const execAsync = promisify(exec);
 const VIDEO_CONCURRENCY = 3;
 
 interface ScrapedVideo {
@@ -21,21 +34,24 @@ interface ScrapedVideo {
 async function runWithConcurrency<T>(
   items: T[],
   concurrency: number,
-  fn: (item: T) => Promise<void>
+  fn: (item: T) => Promise<void>,
 ): Promise<void> {
   let index = 0;
-  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-    while (index < items.length) {
-      const i = index++;
-      await fn(items[i]);
-    }
-  });
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (index < items.length) {
+        const i = index++;
+        await fn(items[i]);
+      }
+    },
+  );
   await Promise.all(workers);
 }
 
 export async function runPipeline(
   params: PipelineParams,
-  onProgress: (progress: PipelineProgress) => void
+  onProgress: (progress: PipelineProgress) => void,
 ): Promise<void> {
   const progress: PipelineProgress = {
     status: "running",
@@ -51,7 +67,12 @@ export async function runPipeline(
   };
 
   const emit = () => {
-    onProgress({ ...progress, activeTasks: [...progress.activeTasks], log: [...progress.log], errors: [...progress.errors] });
+    onProgress({
+      ...progress,
+      activeTasks: [...progress.activeTasks],
+      log: [...progress.log],
+      errors: [...progress.errors],
+    });
   };
 
   const log = (msg: string) => {
@@ -66,7 +87,10 @@ export async function runPipeline(
 
   const updateTask = (id: string, step: string) => {
     const t = progress.activeTasks.find((t) => t.id === id);
-    if (t) { t.step = step; emit(); }
+    if (t) {
+      t.step = step;
+      emit();
+    }
   };
 
   const removeTask = (id: string) => {
@@ -84,8 +108,13 @@ export async function runPipeline(
 
     // Load creators
     const allCreators = readCreators();
-    const creators = allCreators.filter((c) => c.category === config.creatorsCategory);
-    if (creators.length === 0) throw new Error(`No creators found for category "${config.creatorsCategory}"`);
+    const creators = allCreators.filter(
+      (c) => c.category === config.creatorsCategory,
+    );
+    if (creators.length === 0)
+      throw new Error(
+        `No creators found for category "${config.creatorsCategory}"`,
+      );
 
     progress.creatorsTotal = creators.length;
     log(`Found ${creators.length} creators — scraping all in parallel`);
@@ -93,15 +122,25 @@ export async function runPipeline(
 
     // Phase 1: Scrape all creators in parallel
     progress.phase = "scraping";
-    const cutoffDate = new Date(Date.now() - params.nDays * 24 * 60 * 60 * 1000);
+    const cutoffDate = new Date(
+      Date.now() - params.nDays * 24 * 60 * 60 * 1000,
+    );
     const allTopVideos: ScrapedVideo[] = [];
 
     const scrapeResults = await Promise.allSettled(
       creators.map(async (creator) => {
         const taskId = `scrape-${creator.username}`;
-        addTask({ id: taskId, creator: creator.username, step: "Scraping reels" });
+        addTask({
+          id: taskId,
+          creator: creator.username,
+          step: "Scraping reels",
+        });
 
-        const reels = await scrapeReels(creator.username, params.maxVideos, params.nDays);
+        const reels = await scrapeReels(
+          creator.username,
+          params.maxVideos,
+          params.nDays,
+        );
         updateTask(taskId, `Found ${reels.length} reels`);
 
         const videos = reels
@@ -123,14 +162,16 @@ export async function runPipeline(
         const topVideos = videos.slice(0, params.topK);
 
         updateTask(taskId, `Top ${topVideos.length} selected`);
-        log(`@${creator.username}: ${reels.length} reels → top ${topVideos.length} selected`);
+        log(
+          `@${creator.username}: ${reels.length} reels → top ${topVideos.length} selected`,
+        );
 
         removeTask(taskId);
         progress.creatorsScraped++;
         emit();
 
         return { creator: creator.username, videos: topVideos };
-      })
+      }),
     );
 
     for (const result of scrapeResults) {
@@ -148,7 +189,9 @@ export async function runPipeline(
     }
 
     progress.videosTotal = allTopVideos.length;
-    log(`Scraping done. ${allTopVideos.length} videos to analyze (${VIDEO_CONCURRENCY} workers)`);
+    log(
+      `Scraping done. ${allTopVideos.length} videos to analyze (${VIDEO_CONCURRENCY} workers)`,
+    );
     emit();
 
     // Phase 2: Process videos concurrently
@@ -162,12 +205,28 @@ export async function runPipeline(
       const label = `${video.views.toLocaleString()} views`;
 
       try {
-        addTask({ id: taskId, creator: video.username, step: "Downloading", views: video.views });
+        addTask({
+          id: taskId,
+          creator: video.username,
+          step: "Downloading",
+          views: video.views,
+        });
 
-        const videoResponse = await fetch(video.videoUrl);
-        if (!videoResponse.ok) throw new Error(`Download failed: ${videoResponse.status}`);
-        const videoBuffer = Buffer.from(await videoResponse.arrayBuffer());
-        const contentType = videoResponse.headers.get("content-type") || "video/mp4";
+        let videoBuffer: Buffer | null = null;
+        let contentType = "video/mp4";
+
+        const tmpFile = path.join(os.tmpdir(), `video-${taskId}.mp4`);
+        try {
+          await execAsync(
+            `yt-dlp -o "${tmpFile}" --no-playlist "${video.postUrl}"`,
+          );
+          videoBuffer = fs.readFileSync(tmpFile);
+          fs.unlinkSync(tmpFile);
+        } catch (err) {
+          throw new Error(
+            `yt-dlp download failed: ${err instanceof Error ? err.message : err}`,
+          );
+        }
 
         updateTask(taskId, "Uploading to Gemini");
         log(`@${video.username} (${label}): uploading to Gemini`);
@@ -180,13 +239,16 @@ export async function runPipeline(
         const analysis = await analyzeVideo(
           fileData.uri,
           fileData.mimeType,
-          config.analysisInstruction
+          config.analysisInstruction,
         );
 
         updateTask(taskId, "Claude generating concepts");
         log(`@${video.username} (${label}): Claude generating concepts`);
 
-        const newConcepts = await generateNewConcepts(analysis, config.newConceptsInstruction);
+        const newConcepts = await generateNewConcepts(
+          analysis,
+          config.newConceptsInstruction,
+        );
 
         const videoRecord: Video = {
           id: uuid(),
@@ -226,7 +288,9 @@ export async function runPipeline(
 
     progress.phase = "done";
     progress.status = "completed";
-    log(`Pipeline complete! ${progress.videosAnalyzed}/${progress.videosTotal} videos analyzed, ${progress.errors.length} errors.`);
+    log(
+      `Pipeline complete! ${progress.videosAnalyzed}/${progress.videosTotal} videos analyzed, ${progress.errors.length} errors.`,
+    );
     emit();
   } catch (err) {
     progress.status = "error";
